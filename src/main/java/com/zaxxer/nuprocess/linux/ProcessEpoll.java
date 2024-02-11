@@ -21,6 +21,7 @@ import java.util.LinkedList;
 import java.util.List;
 
 import com.sun.jna.Native;
+import com.sun.jna.Structure;
 import com.sun.jna.ptr.IntByReference;
 import com.zaxxer.nuprocess.NuProcess;
 import com.zaxxer.nuprocess.internal.BaseEventProcessor;
@@ -36,8 +37,10 @@ import static com.zaxxer.nuprocess.internal.LibC.WTERMSIG;
  */
 class ProcessEpoll extends BaseEventProcessor<LinuxProcess>
 {
+   private static final int EPOLL_MAX_EVENTS = 20;
    private final int epoll;
-   private final EpollEvent triggeredEvent;
+   private final EpollEvent[] triggeredEvents;
+   private final EpollEvent firstEvent;
    private final List<LinuxProcess> deadPool;
 
    private LinuxProcess process;
@@ -67,7 +70,17 @@ class ProcessEpoll extends BaseEventProcessor<LinuxProcess>
          throw new RuntimeException("Unable to create kqueue, errno: " + errno);
       }
 
-      triggeredEvent = new EpollEvent();
+      triggeredEvents = new EpollEvent[EPOLL_MAX_EVENTS];
+
+      EpollEvent.EpollEventPrototype epollEvent = Structure.newInstance(EpollEvent.EpollEventPrototype.class);
+      EpollEvent.EpollEventPrototype[] array = (EpollEvent.EpollEventPrototype[]) epollEvent.toArray(EPOLL_MAX_EVENTS);
+
+      for (int i = 0; i < EPOLL_MAX_EVENTS; i++) {
+         EpollEvent.EpollEventPrototype proto = array[i];
+         triggeredEvents[i] = new EpollEvent(proto.getPointer());
+      }
+
+      firstEvent = triggeredEvents[0];
 
       deadPool = new LinkedList<>();
    }
@@ -186,12 +199,8 @@ class ProcessEpoll extends BaseEventProcessor<LinuxProcess>
    @Override
    public boolean process()
    {
-      int stdinFd = Integer.MIN_VALUE;
-      int stdoutFd = Integer.MIN_VALUE;
-      int stderrFd = Integer.MIN_VALUE;
-      LinuxProcess linuxProcess = null;
       try {
-         int nev = LibEpoll.epoll_wait(epoll, triggeredEvent.getPointer(), 1, DEADPOOL_POLL_INTERVAL);
+         int nev = LibEpoll.epoll_wait(epoll, firstEvent.getPointer(), EPOLL_MAX_EVENTS, DEADPOOL_POLL_INTERVAL);
          if (nev == -1) {
             int errno = Native.getLastError();
             if (errno == LibC.EINTR) {
@@ -210,28 +219,45 @@ class ProcessEpoll extends BaseEventProcessor<LinuxProcess>
             return false;
          }
 
-         EpollEvent epEvent = triggeredEvent;
+         for (int i = 0; i < nev; i++) {
+            EpollEvent triggeredEvent = triggeredEvents[i];
+            processEpollEvent(triggeredEvent);
+         }
+
+         return true;
+      } finally {
+         checkDeadPool();
+      }
+   }
+
+   private void processEpollEvent(EpollEvent epEvent) {
+      int stdinFd = Integer.MIN_VALUE;
+      int stdoutFd = Integer.MIN_VALUE;
+      int stderrFd = Integer.MIN_VALUE;
+      LinuxProcess linuxProcess = null;
+      try {
+
+
          int ident = epEvent.getFileDescriptor();
          int events = epEvent.getEvents();
 
          linuxProcess = fildesToProcessMap.get(ident);
          if (linuxProcess == null) {
-            return true;
+            return;
          }
 
          stdinFd = linuxProcess.getStdin().acquire();
          stdoutFd = linuxProcess.getStdout().acquire();
          stderrFd = linuxProcess.getStderr().acquire();
 
+
          if ((events & LibEpoll.EPOLLIN) != 0) { // stdout/stderr data available to read
             if (ident == stdoutFd) {
                linuxProcess.readStdout(NuProcess.BUFFER_CAPACITY, stdoutFd);
-            }
-            else if (ident == stderrFd) {
+            } else if (ident == stderrFd) {
                linuxProcess.readStderr(NuProcess.BUFFER_CAPACITY, stderrFd);
             }
-         }
-         else if ((events & LibEpoll.EPOLLOUT) != 0) { // Room in stdin pipe available to write
+         } else if ((events & LibEpoll.EPOLLOUT) != 0) { // Room in stdin pipe available to write
             if (stdinFd != -1) {
                if (linuxProcess.writeStdin(NuProcess.BUFFER_CAPACITY, stdinFd)) {
                   epEvent.setEvents(LibEpoll.EPOLLOUT | LibEpoll.EPOLLONESHOT | LibEpoll.EPOLLRDHUP | LibEpoll.EPOLLHUP);
@@ -244,11 +270,9 @@ class ProcessEpoll extends BaseEventProcessor<LinuxProcess>
             LibEpoll.epoll_ctl(epoll, LibEpoll.EPOLL_CTL_DEL, ident, null);
             if (ident == stdoutFd) {
                linuxProcess.readStdout(-1, stdoutFd);
-            }
-            else if (ident == stderrFd) {
+            } else if (ident == stderrFd) {
                linuxProcess.readStderr(-1, stderrFd);
-            }
-            else if (ident == stdinFd) {
+            } else if (ident == stdinFd) {
                linuxProcess.closeStdin(true);
             }
          }
@@ -256,22 +280,16 @@ class ProcessEpoll extends BaseEventProcessor<LinuxProcess>
          if (linuxProcess.isSoftExit()) {
             cleanupProcess(linuxProcess, stdinFd, stdoutFd, stderrFd);
          }
-
-         return true;
-      }
-      finally {
-         if (linuxProcess != null) {
-            if (stdinFd != Integer.MIN_VALUE) {
-               linuxProcess.getStdin().release();
-            }
-            if (stdoutFd != Integer.MIN_VALUE) {
-               linuxProcess.getStdout().release();
-            }
-            if (stderrFd != Integer.MIN_VALUE) {
-               linuxProcess.getStderr().release();
-            }
+      } finally {
+         if (stdinFd != Integer.MIN_VALUE) {
+            linuxProcess.getStdin().release();
          }
-         checkDeadPool();
+         if (stdoutFd != Integer.MIN_VALUE) {
+            linuxProcess.getStdout().release();
+         }
+         if (stderrFd != Integer.MIN_VALUE) {
+            linuxProcess.getStderr().release();
+         }
       }
    }
 

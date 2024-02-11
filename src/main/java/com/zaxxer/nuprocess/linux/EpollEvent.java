@@ -40,6 +40,10 @@ class EpollEvent
       pointer = new Memory(size);
    }
 
+   EpollEvent(Pointer pointer) {
+      this.pointer = pointer;
+   }
+
    int getEvents() {
       return pointer.getInt(eventsOffset);
    }
@@ -79,7 +83,7 @@ class EpollEvent
       public int events;
       public EpollData data;
 
-      EpollEventPrototype() {
+      public EpollEventPrototype() {
          super(detectAlignment());
 
          data = new EpollData();
@@ -91,7 +95,6 @@ class EpollEvent
          return fieldOffset(field);
       }
 
-      @SuppressWarnings("rawtypes")
       @Override
       protected List<String> getFieldOrder() {
          return Arrays.asList("events", "data");
